@@ -380,60 +380,238 @@ def suppress_between_peak_valley(
 # =========================
 # Baseline core
 # =========================
-def safe_qvri_blend(y, b, r_idx, fs,
-                    alpha0=0.85,       # 기본 감산 비율(최대치)
-                    beta=0.6,          # baseline 크기 클램프 계수
-                    p_lo=0.28, p_hi=0.12,  # PQ 창 (R_prev - [0.28..0.12] * RR)
-                    st_lo=0.08, st_hi=0.22 # ST 창 (R_cur  + [0.08..0.22] * RR)
-                    ):
+
+class BeatTemplateMemory:
     """
-    y: QVRi 적용 전/후 신호 중 baseline을 뺄 대상
-    b: QVRi로 추정된 baseline
-    r_idx: R 위치들
-    - baseline을 국소 에너지에 맞춰 클램프하고, P/ST에서는 감산 비율을 낮춰 '뒤집힘' 방지
-    - alpha는 국소 baseline/신호 비율로 자동 축소(과감산 방지)
+    P/ST 구간의 '모양'과 '레벨'을 지수이동평균(EMA) 템플릿으로 기억.
+    - length: 각 구간을 고정 샘플수로 정규화(리샘플)하여 템플릿 저장
+    - alpha: 템플릿 업데이트 계수(0.1~0.3 권장)
+    """
+    def __init__(self, p_len=80, st_len=120, alpha=0.18):
+        self.p_len  = int(p_len)
+        self.st_len = int(st_len)
+        self.alpha  = float(alpha)
+        self.p_tpl  = None  # shape [p_len]
+        self.st_tpl = None  # shape [st_len]
+
+    def _resample_fixed(self, seg: np.ndarray, L: int) -> np.ndarray:
+        if seg.size <= 1:
+            return np.zeros(L, float)
+        xs = np.linspace(0.0, 1.0, num=seg.size, endpoint=True)
+        xt = np.linspace(0.0, 1.0, num=L,       endpoint=True)
+        f  = interp1d(xs, seg.astype(float), kind='linear', fill_value='extrapolate', assume_sorted=True)
+        return f(xt)
+
+    def update(self, p_seg: np.ndarray, st_seg: np.ndarray):
+        if p_seg is not None and p_seg.size > 3:
+            rp = self._resample_fixed(p_seg, self.p_len) - np.mean(p_seg)
+            self.p_tpl = rp if self.p_tpl is None else (1.0 - self.alpha) * self.p_tpl + self.alpha * rp
+        if st_seg is not None and st_seg.size > 3:
+            rs = self._resample_fixed(st_seg, self.st_len) - np.mean(st_seg)
+            self.st_tpl = rs if self.st_tpl is None else (1.0 - self.alpha) * self.st_tpl + self.alpha * rs
+
+
+def _roi_bounds(idx, fs, pre_ms, post_ms, N):
+    a = max(0, int(idx + pre_ms * 1e-3 * fs))
+    b = min(N, int(idx + post_ms * 1e-3 * fs))
+    return (a, b) if (b - a) >= max(5, int(0.04 * fs)) else (None, None)
+
+def build_roi_windows(r_idx, fs, N, p_win=(-220, -100), st_win=(+120, +260)):
+    wins = []
+    for r in r_idx:
+        a,b = _roi_bounds(r, fs, p_win[0], p_win[1], N)
+        if a is not None: wins.append((a,b))
+        a,b = _roi_bounds(r, fs, st_win[0], st_win[1], N)
+        if a is not None: wins.append((a,b))
+    return wins
+
+def roi_pchip_fill_baseline(b, wins):
+    """각 ROI에서 baseline을 양 끝 경계값으로 PCHIP 보간해 '평탄/경계보존'으로 채움."""
+    b = np.asarray(b, float).copy(); N = b.size
+    for (a, bnd) in wins:
+        a0 = max(0, a-1); b0 = min(N-1, bnd)
+        if b0 - a0 < 3: continue
+        xs = np.array([a0, b0], dtype=float)
+        ys = np.array([b[a0], b[b0]], dtype=float)
+        f  = PchipInterpolator(xs, ys, extrapolate=True)
+        b[a:bnd] = f(np.arange(a, bnd))
+    return b
+
+def roi_adaptive_mix(y_qvri_out, y_med_out, wins, fs, gamma=0.5, corr_min=0.15):
+    """
+    ROI에서 QVRi 출력과 메디안 출력의 가중 혼합.
+    - 기본: y = (1-γ)*QVRi + γ*Median
+    - 상관이 낮거나(QVRi가 P/ST를 누른 흔적) polarity 불안정하면 γ를 자동 상향.
+    """
+    yq = np.asarray(y_qvri_out, float).copy()
+    ym = np.asarray(y_med_out,  float)
+    N = yq.size
+    for (a, b) in wins:
+        a = max(0, int(a)); b = min(N, int(b))
+        if b - a < 5: continue
+        s_q = yq[a:b]; s_m = ym[a:b]
+        # 상관/극성 평가
+        m_q, m_m = s_q.mean(), s_m.mean()
+        v_q = np.var(s_q) + 1e-9
+        cov = float(np.dot(s_q - m_q, s_m - m_m)) / max(1.0, (b - a))
+        rho = float(cov / (np.sqrt(v_q) * (np.std(s_m) + 1e-9)))
+        g = float(gamma)
+        if (rho < corr_min) or (cov < 0):
+            g = min(0.85, max(gamma, 0.65))  # 혼합 가중 자동 상향(메디안 쪽 비중↑)
+        # 경계 블렌딩(해닝)
+        L = b - a
+        Lw = max(3, int(round(0.06 * fs))); Lw += (Lw % 2 == 0)
+        if 2*Lw < L:
+            wL = np.linspace(0, 1, Lw, endpoint=False)
+            wM = np.ones(L - 2*Lw)
+            wR = np.linspace(1, 0, Lw, endpoint=False)
+            edge = np.concatenate([wL, wM, wR])
+        else:
+            edge = np.linspace(0, 1, L, endpoint=False)
+        mix = (1 - g) * s_q + g * s_m
+        yq[a:b] = edge * mix + (1 - edge) * s_q  # 경계에서 QVRi 연속성 유지
+    return yq
+
+def build_protect_windows(r_idx, fs, N,
+                          p_win=(-220, -100), st_win=(+120, +260)):
+    wins = []
+    for r in r_idx:
+        a,b = _roi_bounds(r, fs, p_win[0], p_win[1], N)
+        if a is not None: wins.append((a,b))
+        a,b = _roi_bounds(r, fs, st_win[0], st_win[1], N)
+        if a is not None: wins.append((a,b))
+    return wins
+def affine_restore_roi(y_before, y_after, windows,
+                       gmin=0.92, gmax=1.15, off_cap=0.30,
+                       blend_ms=60, fs=250.0,
+                       corr_min=0.15,   # 상관 guard 임계
+                       skip_if_negative=False):
+    """
+    y_after ≈ a*y_before + b 를 ROI별로 추정하되,
+    - 상관이 낮거나 음수면 a=1(게인 X), b(오프셋)만 적용(또는 스킵)
+    - a,b는 안전 캡
+    """
+    x0 = np.asarray(y_before, float)
+    x1 = np.asarray(y_after,  float).copy()
+    N = x0.size
+    for (a, b) in windows:
+        a = max(0, int(a)); b = min(N, int(b))
+        if b - a < 5:
+            continue
+        s0 = x0[a:b]; s1 = x1[a:b]
+        m0 = s0.mean(); m1 = s1.mean()
+        v0 = np.var(s0) + 1e-9
+        cov = float(np.dot(s0 - m0, s1 - m1)) / max(1.0, (b - a))
+        # 피어슨 상관 (수치 안정)
+        rho = float(cov / (np.sqrt(v0) * (np.std(s1) + 1e-9)))
+
+        # 최소제곱 게인/오프셋
+        a_hat = cov / v0
+        b_hat = m1 - a_hat * m0
+
+        # === 극성 가드 ===
+        if (rho < corr_min) or (cov < 0):
+            if skip_if_negative:
+                # 완전 스킵
+                continue
+            # 게인은 금지(a=1), 오프셋만(레벨 정렬; 과보정 캡)
+            a_hat = 1.0
+            b_hat = float(np.clip(m0 - m1, -off_cap, off_cap))  # 원신호 평균에 맞춤
+        else:
+            # 정상 케이스: 안전 캡
+            a_hat = float(np.clip(a_hat, gmin, gmax))
+            b_hat = float(np.clip(b_hat, -off_cap, off_cap))
+
+        # 블렌딩 적용
+        L = b - a
+        Lb = max(3, int(round(blend_ms * 1e-3 * fs))); Lb += (Lb % 2 == 0)
+        if 2*Lb < L:
+            left  = np.linspace(0.0, 1.0, Lb, endpoint=False)
+            mid   = np.ones(L - 2*Lb)
+            right = np.linspace(1.0, 0.0, Lb, endpoint=False)
+            w = np.concatenate([left, mid, right])
+        else:
+            w = np.linspace(0.0, 1.0, L, endpoint=False)
+
+        target = a_hat * s0 + b_hat
+        x1[a:b] = (1 - w) * s1 + w * target
+    return x1
+
+
+
+def apply_template_guided_restore(
+    y: np.ndarray, fs: float, r_idx: np.ndarray, mem: BeatTemplateMemory,
+    p_win=(-220, -100), st_win=(+120, +260),
+    add_cap=0.35,                   # 박자별 additive 복원 한도
+    gmin=0.92, gmax=1.15,           # bounded gain 범위
+    blend_ms=60                     # 가장자리 블렌딩
+) -> np.ndarray:
+    """
+    이전 박자 템플릿을 현재 박자에 '약하게' 씌워 P/ST를 복원.
+    - 1단계: additive offset(레벨) 보정(±add_cap)
+    - 2단계: bounded gain(형태 유지하며 크기만 살짝)
     """
     x = np.asarray(y, float).copy()
-    b = np.asarray(b, float).copy()
     N = x.size
-    if N == 0 or b.size != N:
+    if r_idx is None or len(r_idx) < 3:
         return x
 
-    # 0) 아주 저주파만 남기기(고주파 성분 포함된 b가 신호를 먹는 것 방지)
-    #   → baseline이 너무 예리하면 부호 반전 발생
-    b = highpass_zero_drift(b, fs, fc=0.15)  # DC/초저주파만 유지
+    def _apply_add_gain(lo, hi, target_mean, add_cap, gain, blend_ms):
+        L = hi - lo
+        if L < 3: return
+        seg = x[lo:hi]
+        # 1) additive (레벨 복원)
+        delta = np.clip(target_mean - float(np.mean(seg)), -float(add_cap), float(add_cap))
+        seg2  = seg + delta
+        # 2) bounded gain (형태 유지하며 살짝 키움/줄임)
+        g = float(np.clip(gain, gmin, gmax))
+        if g != 1.0:
+            Lb = max(3, int(round(blend_ms * 1e-3 * fs))); Lb += (Lb % 2 == 0)
+            if 2*Lb < L:
+                left  = np.linspace(1.0, g, Lb, endpoint=False)
+                mid   = np.full(L - 2*Lb, g)
+                right = np.linspace(g, 1.0, Lb, endpoint=False)
+                w = np.concatenate([left, mid, right])
+            else:
+                w = np.linspace(1.0, g, L, endpoint=False)
+            seg2 = seg2 * w
+        x[lo:hi] = seg2
 
-    # 1) 국소 에너지 기반 클램프: |b| ≤ beta * env
-    win = max(3, int(round(0.25 * fs)))  # 250Hz 기준 ≈ 0.25s
-    env = uniform_filter1d(np.abs(x), size=win, mode='nearest') + 1e-9
-    lim = beta * env
-    b = np.clip(b, -lim, lim)
+    # 박자 순회: 이전 박자의 템플릿으로 현재 박자를 복원 → 그 다음 템플릿 업데이트
+    for k in range(1, len(r_idx)-1):
+        r_prev, r_cur = r_idx[k-1], r_idx[k]
 
-    # 2) 적응적 alpha: baseline이 신호보다 크면 자동 축소
-    #    alpha_eff = min(alpha0, 0.6 * env/|b|)
-    ratio = np.clip(env / (np.abs(b) + 1e-9), 0.0, 3.0)
-    alpha_eff = np.minimum(alpha0, 0.6 * ratio)
+        # --- P 구간 ---
+        aP, bP = _roi_bounds(r_cur, fs, p_win[0], p_win[1], N)
+        # --- ST 구간 ---
+        aS, bS = _roi_bounds(r_cur, fs, st_win[0], st_win[1], N)
 
-    # 3) P/ST 보호: RR-비율 창에서 alpha 50% 감축
-    if r_idx is not None and len(r_idx) >= 3:
-        mask = np.zeros(N, dtype=bool)
-        for k in range(1, len(r_idx)-1):
-            rr = max(1, int(r_idx[k] - r_idx[k-1]))
-            # PQ (이전 R 기준)
-            a_pq = int(round(r_idx[k-1] - p_lo * rr)); b_pq = int(round(r_idx[k-1] - p_hi * rr))
-            # ST (현재 R 기준)
-            a_st = int(round(r_idx[k] + st_lo * rr));  b_st = int(round(r_idx[k] + st_hi * rr))
-            a_pq = max(0, a_pq); b_pq = min(N, b_pq)
-            a_st = max(0, a_st); b_st = min(N, b_st)
-            if b_pq - a_pq >= max(5, int(0.04*fs)): mask[a_pq:b_pq] = True
-            if b_st - a_st >= max(5, int(0.04*fs)): mask[a_st:b_st] = True
-        if mask.any():
-            alpha_eff[mask] *= 0.5  # P/ST에서는 절반만 뺌
+        # 템플릿이 있으면 '복원'
+        if mem.p_tpl is not None and (aP is not None):
+            curP = x[aP:bP]
+            # 템플릿과 RMS 매칭으로 gain 추정(안정적)
+            tplP = mem._resample_fixed(mem.p_tpl, curP.size)
+            tplP = tplP - np.mean(tplP)
+            rms_cur = np.sqrt(np.mean(curP**2)) + 1e-9
+            rms_tpl = np.sqrt(np.mean(tplP**2)) + 1e-9
+            gainP   = (rms_tpl / rms_cur) if rms_cur > 0 else 1.0
+            _apply_add_gain(aP, bP, target_mean=0.0, add_cap=add_cap, gain=gainP, blend_ms=blend_ms)
 
-    # 4) 안전 감산
-    x = x - alpha_eff * b
+        if mem.st_tpl is not None and (aS is not None):
+            curS = x[aS:bS]
+            tplS = mem._resample_fixed(mem.st_tpl, curS.size)
+            tplS = tplS - np.mean(tplS)
+            rms_cur = np.sqrt(np.mean(curS**2)) + 1e-9
+            rms_tpl = np.sqrt(np.mean(tplS**2)) + 1e-9
+            gainS   = (rms_tpl / rms_cur) if rms_cur > 0 else 1.0
+            _apply_add_gain(aS, bS, target_mean=0.0, add_cap=add_cap, gain=gainS, blend_ms=blend_ms)
+
+        # 현재 박자의(복원 후) P/ST로 템플릿 업데이트
+        p_seg = (x[aP:bP] if aP is not None else None)
+        s_seg = (x[aS:bS] if aS is not None else None)
+        mem.update(p_seg, s_seg)
+
     return x
-
 
 class ReferenceBeatMemory:
     """
@@ -682,15 +860,16 @@ def _qvri_residual_isoelectric(
     y: np.ndarray,
     fs: float,
     r_idx: np.ndarray,
-    t0_ms: int = 80,
-    t1_ms: int = 300,
-    stride: int = 1,      # 결정점 간격: 1이면 모든 박자, 2/3이면 일부만 사용
-    lam: float = 3e3,     # QVRi 매끈함 제어(커질수록 더 매끈)
-    pin_strength: float = 1e9,  # 결정점 강제 정도(매우 크게 = equality에 근접)
+    t0_ms: int = -240,    # ← PQ를 앵커로 권장
+    t1_ms: int = -100,
+    stride: int = 1,
+    lam: float = 2e3,
+    pin_strength: float = 1e9,
+    protect_windows: list = None,   # [(a,b), ...] 보호 구간
+    w_protect: float = 1e-6         # 보호 구간 데이터 가중치 (거의 0)
 ) -> tuple:
     """
-    QVRi 아이디어 기반의 '등전위 고정점' 제약을 걸어 residual baseline을 추정.
-    입력 y는 '이미 어느 정도 보정된 신호'(y_corr_eq)를 권장한다.
+    QVRi에 '보호 구간'을 주어 그 구간의 신호를 깎지 않도록 함.
     반환: (y_qvri, baseline_qvri)
     """
     x = np.asarray(y, float)
@@ -698,58 +877,51 @@ def _qvri_residual_isoelectric(
     if N < 10 or r_idx is None or len(r_idx) < 2:
         return x, np.zeros_like(x)
 
-    # 1) 등전위 결정점 추출 (R 이후 t0~t1 구간 중앙, 값은 구간 메디안)
+    # 1) PQ 기반 결정점(앵커)
     t0 = int(round(t0_ms * 1e-3 * fs))
     t1 = int(round(t1_ms * 1e-3 * fs))
     idx_knot, val_knot = [], []
     for k, r in enumerate(r_idx[:-1]):
         if (k % max(1, int(stride))) != 0:
             continue
-        a = r + t0
-        b = r + t1
+        a = r + t0; b = r + t1
         if a < 0 or b > N or (b - a) < max(5, int(0.04 * fs)):
             continue
         m = float(np.median(x[a:b]))
         idx_knot.append(int((a + b) // 2))
         val_knot.append(m)
-
     if len(idx_knot) == 0:
         return x, np.zeros_like(x)
-
     idx_knot = np.asarray(idx_knot, dtype=int)
     val_knot = np.asarray(val_knot, dtype=float)
 
-    # 2) 가중 최소자승 + 2차차분 정규화: (W + lam * L) z = W * y0
-    #    - W: 대각 행렬(결정점에 큰 가중치, 그 외 1)
-    #    - y0: 결정점 위치는 등전위값(val_knot), 그 외는 원신호
-    y0 = x.copy()
-    y0[idx_knot] = val_knot
+    # 2) 데이터항 가중치 W: 기본 1, 보호구간은 w_protect, 결정점은 pin_strength
     w = np.ones(N, dtype=float)
+    if protect_windows:
+        for (a, b) in protect_windows:
+            a = max(0, int(a)); b = min(N, int(b))
+            if b > a:
+                w[a:b] = float(w_protect)
     w[idx_knot] = float(pin_strength)
 
-    # 2.1) 2차차분 제곱 정규화의 대역행렬(상삼각 banded) 구성
-    #      ab_u[0,:]=상상대각(+2), ab_u[1,:]=주변대각(+1), ab_u[2,:]=주대각(0)
+    # 3) y0: 결정점 위치는 등전위 값, 그 외는 원신호
+    y0 = x.copy()
+    y0[idx_knot] = val_knot
+
+    # 4) (W + lam * D^T D) z = W * y0  를 대역행렬로 풉니다
     ab_u = np.zeros((3, N), dtype=float)
-    # lam * D^T D (표준 2차차분 정규화의 3-대각 근사: [1, -4, 6, -4, 1]의 축약형)
     ab_u[0, 2:] = lam * 1.0
     ab_u[1, 1:] = lam * (-4.0)
     ab_u[2, :]  = lam * 6.0
-    # 데이터 항 가중치 W 추가
     ab_u[2, :] += w
-
-    b = w * y0
-
-    # 2.2) 대역선형계 풀이
-    z = solveh_banded(ab_u, b, lower=False, overwrite_ab=False,
+    bvec = w * y0
+    z = solveh_banded(ab_u, bvec, lower=False, overwrite_ab=False,
                       overwrite_b=True, check_finite=False)
 
-    # 3) residual baseline(=z)를 빼서 등전위 정렬
-    baseline_qvri = z
-    y_qvri = x - baseline_qvri
-    # 등전위 기준 0에 맞추기(드리프트 보정)
-    baseline_qvri -= np.median(baseline_qvri)
-    y_qvri        -= np.median(y_qvri)
+    baseline_qvri = z - np.median(z)
+    y_qvri        = (x - baseline_qvri) - np.median(x - baseline_qvri)
     return y_qvri, baseline_qvri
+
 
 @profiled()
 def baseline_asls_masked(y, lam=1e6, p=0.008, niter=10, mask=None,
@@ -1432,22 +1604,43 @@ class ECGViewer(QtWidgets.QWidget):
         detector = rPeakDetector(fs=int(FS))
         r_after = np.asarray(detector.rPeakDetection(y_corr_eq), int)
         v_after = np.asarray(detector.vValleyDetection(y_corr_eq), int)
+        # 보호 구간(P/ST) 생성
+        wins_protect = build_protect_windows(r_after, FS, y_corr.size,
+                                             p_win=(-220, -100), st_win=(+120, +260))
 
-        # === QVRi residual isoelectric recovery (논문 아이디어 적용) ===
-        # R 이후 80–300 ms 구간 메디안으로 등전위 결정점 생성 → 매끈한 residual baseline 추정 후 제거
-        y_corr_eq, base_qvri = _qvri_residual_isoelectric(
-            y_corr_eq, FS, r_after,
-            t0_ms=-240, t1_ms=-100,  # PQ(등전위) 대략 범위
-            stride=2,  # 1=모든 박자, 2/3=일부만 사용(속도↑, 결과 거의 동일)
-            lam=800,  # 매끈함(커질수록 완만)
-            pin_strength=1e6  # 결정점 강제 정도(매우 큼=거의 equality)
+        # === QVRi (PQ 앵커 + ROI 보호) ===
+        y_before_qvri = y_corr.copy()  # 원형 저장
+        y_corr_qvri, base_qvri = _qvri_residual_isoelectric(
+            y_corr, FS, r_after,
+            t0_ms=-240, t1_ms=-100, stride=2, lam=2000.0, pin_strength=1e9,
+            protect_windows=wins_protect, w_protect=1e-6
         )
-        # y_corr_eq = safe_qvri_blend(y_corr, base_qvri, r_after, FS,
-        #                             alpha0=0.85, beta=0.6,
-        #                             p_lo=0.28, p_hi=0.12,
-        #                             st_lo=0.08, st_hi=0.22)
 
+        # --- (A) QVRi baseline을 ROI에서 '경계보존 평탄'으로 교체 ---
+        roi_wins = build_roi_windows(r_after, FS, y_corr.size,
+                                     p_win=(-220, -100), st_win=(+120, +260))
+        base_qvri_roi = roi_pchip_fill_baseline(base_qvri, roi_wins)
+        y_qvri_edge = y_corr - base_qvri_roi  # 경계값 일치한 QVRi 출력
 
+        # --- (B) 메디안 짧게(≈0.4~0.6s)로 만든 'P/ST 보존' 출력 생성 ---
+        y_med_base = signal.medfilt(y_corr, kernel_size=101)  # FS=250 기준 ≈0.4s 권장
+        y_med_out = y_corr - y_med_base
+
+        # --- (C) ROI에서 두 결과의 적응 혼합(기본 γ=0.5, 자동 상향) ---
+        y_corr_eq = roi_adaptive_mix(y_qvri_out=y_qvri_edge,
+                                     y_med_out=y_med_out,
+                                     wins=roi_wins, fs=FS,
+                                     gamma=0.5, corr_min=0.15)
+
+        # # Q/ST 국소 affine 복구 (원신호 기준)
+        # y_corr_eq = affine_restore_roi(
+        #     y_before_qvri, y_corr_qvri, wins_protect,
+        #     gmin=0.95, gmax=1.12, off_cap=0.25,
+        #     blend_ms=60, fs=FS, corr_min=0.15, skip_if_negative=False
+        # )
+        #
+
+        # y_corr_eq = y_corr_qvri
 
         # 오버레이 표시
         if self.cb_rpeaks.isChecked() and r_after.size > 0:
